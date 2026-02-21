@@ -1,0 +1,11 @@
+.env
+sessions/
+data/
+__pycache__/
+*.pyc
+*.pyo
+.cursor/
+.vscode/
+*.egg-info/
+dist/
+build/

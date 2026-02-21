@@ -1,0 +1,4 @@
+instagrapi>=2.1.2
+python-dotenv>=1.0.0
+rich>=13.7.0
+schedule>=1.2.0
