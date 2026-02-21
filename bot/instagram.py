@@ -65,7 +65,23 @@ class InstagramClient:
         self.cl = Client()
         self.cl.delay_range = [1, 3]
         self.cl.challenge_code_handler = self._challenge_code_handler
+        self._set_device()
         self._logged_in = False
+
+    def _set_device(self) -> None:
+        """Use a common device fingerprint to reduce suspicion."""
+        self.cl.set_device({
+            "app_version": "269.0.0.18.75",
+            "android_version": 31,
+            "android_release": "12.0.0",
+            "dpi": "420dpi",
+            "resolution": "1080x2400",
+            "manufacturer": "samsung",
+            "device": "o1s",
+            "model": "SM-G991B",
+            "cpu": "exynos2100",
+            "version_code": "314665256",
+        })
 
     def _challenge_code_handler(self, username: str, choice: ChallengeChoice) -> str | bool:
         """Prompt user to enter verification code from SMS or email."""
@@ -140,6 +156,7 @@ class InstagramClient:
             raise ActionBlockError(f"Action block during login: {exc}") from exc
 
     def _do_login(self) -> None:
+        self._patch_login_flow()
         if self.totp_seed:
             from instagrapi.mixins.totp import TOTPMixin
             code = TOTPMixin.generate_totp_code(self.totp_seed)
@@ -147,6 +164,24 @@ class InstagramClient:
         else:
             self.cl.login(self.username, self.password)
         self._save_session()
+
+    def _patch_login_flow(self) -> None:
+        """Make login_flow fault-tolerant so the bot survives reels_tray / challenge failures."""
+        original_login_flow = self.cl.login_flow
+
+        def resilient_login_flow() -> bool:
+            self._save_session()
+            logger.info("Session saved before post-login checks")
+            try:
+                return original_login_flow()
+            except Exception as exc:
+                logger.warning(
+                    "Post-login check failed (non-fatal): %s — continuing with saved session",
+                    exc,
+                )
+                return True
+
+        self.cl.login_flow = resilient_login_flow
 
     def _save_session(self) -> None:
         self.cl.dump_settings(self._session_path)
