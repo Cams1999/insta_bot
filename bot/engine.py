@@ -84,6 +84,7 @@ class BotEngine:
             return 0
 
         notifier.notify_info(f"Fetching followers of @{target_username}...")
+        action_delay("fetch")
 
         try:
             target_id = self.ig.get_user_id(target_username)
@@ -95,6 +96,7 @@ class BotEngine:
             return 0
 
         try:
+            action_delay("fetch")
             followers = self.ig.get_followers(target_id, amount=count * 3)
         except ActionBlockError as exc:
             self._handle_action_block(str(exc))
@@ -114,7 +116,7 @@ class BotEngine:
             if followed_count >= count:
                 break
 
-            if not pre_action_gate("follow"):
+            if not pre_action_gate("follow", account_id=self.account_id):
                 notifier.notify_info("Follow limit reached, stopping for now.")
                 break
 
@@ -204,7 +206,7 @@ class BotEngine:
         for user in users:
             if self._check_stopped():
                 break
-            if not pre_action_gate("check"):
+            if not pre_action_gate("check", account_id=self.account_id):
                 break
 
             try:
@@ -272,7 +274,7 @@ class BotEngine:
         for user in users:
             if self._check_stopped():
                 break
-            if not pre_action_gate("unfollow"):
+            if not pre_action_gate("unfollow", account_id=self.account_id):
                 notifier.notify_info("Unfollow limit reached, stopping for now.")
                 break
 

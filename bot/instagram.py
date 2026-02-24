@@ -15,10 +15,12 @@ from typing import Any
 
 from instagrapi import Client
 from instagrapi.exceptions import (
+    BadPassword,
     ChallengeRequired,
     FeedbackRequired,
     LoginRequired,
     PleaseWaitFewMinutes,
+    ProxyAddressIsBlocked,
     UserNotFound,
 )
 from instagrapi.mixins.challenge import ChallengeChoice
@@ -63,10 +65,35 @@ class InstagramClient:
 
         self._session_path = self.session_dir / f"{self.username}_session.json"
         self.cl = Client()
-        self.cl.delay_range = [1, 3]
+        self.cl.delay_range = [5, 15]
         self.cl.challenge_code_handler = self._challenge_code_handler
+        self.cl.handle_exception = self._handle_exception
         self._set_device()
         self._logged_in = False
+
+    def _handle_exception(self, client: Client, exc: Exception) -> None:
+        """
+        Centralized exception handler for instagrapi.
+        Catches common exceptions and raises clean, actionable errors.
+        """
+        if isinstance(exc, ChallengeRequired):
+            logger.warning("Challenge required — Instagram is restricting this request")
+            raise ChallengeError("Instagram challenge on API request") from exc
+        if isinstance(exc, BadPassword):
+            msg = str(exc)
+            if "blacklist" in msg.lower():
+                logger.error("Proxy IP is blacklisted by Instagram")
+                raise ConnectionError("Instagram has blacklisted this IP. Change proxy.") from exc
+            logger.error("Bad password: %s", msg)
+            raise
+        if isinstance(exc, ProxyAddressIsBlocked):
+            logger.error("Proxy address is blocked by Instagram")
+            raise ConnectionError("Proxy IP blocked. Change proxy.") from exc
+        if isinstance(exc, LoginRequired):
+            logger.warning("Login required — session may have expired")
+            self._save_session()
+            raise
+        raise exc
 
     def _set_device(self) -> None:
         """Use a common device fingerprint to reduce suspicion."""
@@ -82,6 +109,7 @@ class InstagramClient:
             "cpu": "exynos2100",
             "version_code": "314665256",
         })
+        self.cl.set_user_agent()
 
     def _challenge_code_handler(self, username: str, choice: ChallengeChoice) -> str | bool:
         """Prompt user to enter verification code from SMS or email."""
@@ -125,7 +153,14 @@ class InstagramClient:
                 return False
             self.cl.set_settings(session)
             self.cl.login(self.username, self.password)
-            self.cl.get_timeline_feed()
+
+            try:
+                self.cl.get_timeline_feed()
+            except LoginRequired:
+                raise
+            except Exception as feed_exc:
+                logger.warning("Session check (timeline_feed) failed, but session may still be valid: %s", feed_exc)
+
             logger.info("Session login successful")
             return True
         except LoginRequired:
@@ -147,6 +182,18 @@ class InstagramClient:
         logger.info("Logging in with username/password")
         try:
             self._do_login()
+        except BadPassword as exc:
+            msg = str(exc)
+            if "blacklist" in msg.lower() or "change your ip" in msg.lower():
+                raise ConnectionError(
+                    "Instagram has blacklisted your IP address. "
+                    "Try a different proxy or connect without proxy to verify your credentials."
+                ) from exc
+            raise ValueError(f"Bad password or username: {msg}") from exc
+        except ProxyAddressIsBlocked as exc:
+            raise ConnectionError(
+                "Instagram has blocked your proxy IP. Try a different proxy."
+            ) from exc
         except ChallengeRequired as exc:
             raise ChallengeError(
                 "Instagram requires verification (email/SMS). "
@@ -197,12 +244,38 @@ class InstagramClient:
     # ------------------------------------------------------------------
 
     def get_user_id(self, username: str) -> str:
-        try:
-            return str(self.cl.user_id_from_username(username))
-        except UserNotFound:
-            raise
-        except ACTION_BLOCK_EXCEPTIONS as exc:
-            raise ActionBlockError(str(exc)) from exc
+        # Try multiple methods; Instagram may block some but not all
+        methods = [
+            ("search", self._get_user_id_via_search),
+            ("v1", self._get_user_id_via_v1),
+        ]
+        last_exc = None
+        for name, method in methods:
+            try:
+                uid = method(username)
+                if uid:
+                    logger.info("Found user @%s via %s (id=%s)", username, name, uid)
+                    return uid
+            except UserNotFound:
+                raise
+            except ACTION_BLOCK_EXCEPTIONS as exc:
+                raise ActionBlockError(str(exc)) from exc
+            except Exception as exc:
+                logger.warning("get_user_id via %s failed: %s", name, exc)
+                last_exc = exc
+        raise last_exc or Exception(f"Could not find user @{username}")
+
+    def _get_user_id_via_search(self, username: str) -> str | None:
+        """Use the search endpoint to find a user by username."""
+        results = self.cl.search_users(username)
+        for user in results:
+            if user.username.lower() == username.lower():
+                return str(user.pk)
+        return None
+
+    def _get_user_id_via_v1(self, username: str) -> str | None:
+        user = self.cl.user_info_by_username_v1(username)
+        return str(user.pk)
 
     def get_user_info(self, user_id: str) -> User:
         try:

@@ -29,7 +29,7 @@ import config as cfg
 
 logger = logging.getLogger("bot.humanizer")
 
-ActionType = Literal["follow", "unfollow", "like", "story_view", "check"]
+ActionType = Literal["follow", "unfollow", "like", "story_view", "check", "fetch"]
 
 # ---------------------------------------------------------------------------
 # Gaussian-bounded delay
@@ -63,11 +63,12 @@ def sleep_human(low: float, high: float, label: str = "") -> None:
 
 _DELAY_MAP: dict[ActionType, tuple[str, str, float, float]] = {
     #  action       cfg_min_attr            cfg_max_attr            fallback_min  fallback_max
-    "follow":      ("FOLLOW_DELAY_MIN",     "FOLLOW_DELAY_MAX",     25.0, 120.0),
-    "unfollow":    ("UNFOLLOW_DELAY_MIN",   "UNFOLLOW_DELAY_MAX",   20.0, 90.0),
-    "like":        ("LIKE_DELAY_MIN",       "LIKE_DELAY_MAX",       5.0,  15.0),
-    "story_view":  ("STORY_VIEW_DELAY_MIN", "STORY_VIEW_DELAY_MAX", 3.0,  10.0),
-    "check":       ("CHECK_DELAY_MIN",      "CHECK_DELAY_MAX",      3.0,  8.0),
+    "follow":      ("FOLLOW_DELAY_MIN",     "FOLLOW_DELAY_MAX",     40.0, 180.0),
+    "unfollow":    ("UNFOLLOW_DELAY_MIN",   "UNFOLLOW_DELAY_MAX",   35.0, 120.0),
+    "like":        ("LIKE_DELAY_MIN",       "LIKE_DELAY_MAX",       8.0,  25.0),
+    "story_view":  ("STORY_VIEW_DELAY_MIN", "STORY_VIEW_DELAY_MAX", 5.0,  18.0),
+    "check":       ("CHECK_DELAY_MIN",      "CHECK_DELAY_MAX",      6.0,  15.0),
+    "fetch":       ("FETCH_DELAY_MIN",      "FETCH_DELAY_MAX",      10.0,  30.0),
 }
 
 
@@ -164,39 +165,39 @@ class SessionBreakTracker:
 # Limit checkers
 # ---------------------------------------------------------------------------
 
-def check_daily_limit(action: str, limit_key: str, default_limit: int) -> bool:
+def check_daily_limit(action: str, limit_key: str, default_limit: int, account_id: int = 0) -> bool:
     """Return True if we are still under the daily limit (with variance)."""
-    base_limit = db.get_config_int(limit_key, default_limit)
+    base_limit = db.get_config_int(limit_key, default_limit, account_id=account_id)
     variance = cfg.DAILY_LIMIT_VARIANCE
     effective = int(base_limit * random.uniform(1 - variance, 1 + variance))
-    today_count = db.count_today_actions(action)
+    today_count = db.count_today_actions(action, account_id=account_id)
     under = today_count < effective
     if not under:
         logger.info("Daily %s limit reached: %d/%d", action, today_count, effective)
     return under
 
 
-def check_hourly_limit(action: str, limit_key: str, default_limit: int) -> bool:
+def check_hourly_limit(action: str, limit_key: str, default_limit: int, account_id: int = 0) -> bool:
     """Return True if we are still under the hourly limit."""
-    limit = db.get_config_int(limit_key, default_limit)
-    hour_count = db.count_hour_actions(action)
+    limit = db.get_config_int(limit_key, default_limit, account_id=account_id)
+    hour_count = db.count_hour_actions(action, account_id=account_id)
     under = hour_count < limit
     if not under:
         logger.info("Hourly %s limit reached: %d/%d", action, hour_count, limit)
     return under
 
 
-def can_follow() -> bool:
+def can_follow(account_id: int = 0) -> bool:
     return (
-        check_daily_limit("follow", "daily_follow_limit", cfg.DAILY_FOLLOW_LIMIT)
-        and check_hourly_limit("follow", "hourly_follow_limit", cfg.HOURLY_FOLLOW_LIMIT)
+        check_daily_limit("follow", "daily_follow_limit", cfg.DAILY_FOLLOW_LIMIT, account_id)
+        and check_hourly_limit("follow", "hourly_follow_limit", cfg.HOURLY_FOLLOW_LIMIT, account_id)
     )
 
 
-def can_unfollow() -> bool:
+def can_unfollow(account_id: int = 0) -> bool:
     return (
-        check_daily_limit("unfollow", "daily_unfollow_limit", cfg.DAILY_UNFOLLOW_LIMIT)
-        and check_hourly_limit("unfollow", "hourly_unfollow_limit", cfg.HOURLY_UNFOLLOW_LIMIT)
+        check_daily_limit("unfollow", "daily_unfollow_limit", cfg.DAILY_UNFOLLOW_LIMIT, account_id)
+        and check_hourly_limit("unfollow", "hourly_unfollow_limit", cfg.HOURLY_UNFOLLOW_LIMIT, account_id)
     )
 
 
@@ -233,18 +234,18 @@ _WARMUP_SCHEDULE = {
 }
 
 
-def get_warmup_daily_limit(start_date: datetime | None = None) -> int | None:
+def get_warmup_daily_limit(start_date: datetime | None = None, account_id: int = 0) -> int | None:
     """
     If warm-up is enabled, return the reduced daily follow limit for the
     current week. Returns None if warm-up is disabled or past week 3.
     """
-    if not db.get_config_bool("warmup_enabled", cfg.WARMUP_ENABLED):
+    if not db.get_config_bool("warmup_enabled", cfg.WARMUP_ENABLED, account_id=account_id):
         return None
 
-    start_str = db.get_config("warmup_start_date")
+    start_str = db.get_config("warmup_start_date", account_id=account_id)
     if not start_str:
         now_str = datetime.utcnow().isoformat()
-        db.set_config("warmup_start_date", now_str, "Date warm-up mode started")
+        db.set_config("warmup_start_date", now_str, "Date warm-up mode started", account_id=account_id)
         start_str = now_str
 
     start = datetime.fromisoformat(start_str)
@@ -258,22 +259,22 @@ def get_warmup_daily_limit(start_date: datetime | None = None) -> int | None:
 # Convenience: full pre-action gate
 # ---------------------------------------------------------------------------
 
-def pre_action_gate(action: ActionType) -> bool:
+def pre_action_gate(action: ActionType, account_id: int = 0) -> bool:
     """
     Combined gate: checks active hours, daily limit, hourly limit.
     Returns True if the action is allowed right now.
     """
     wait_for_active_hours()
 
-    warmup_limit = get_warmup_daily_limit()
+    warmup_limit = get_warmup_daily_limit(account_id=account_id)
     if warmup_limit is not None and action == "follow":
-        today = db.count_today_actions("follow")
+        today = db.count_today_actions("follow", account_id=account_id)
         if today >= warmup_limit:
             logger.info("Warm-up daily limit reached: %d/%d", today, warmup_limit)
             return False
 
     if action == "follow":
-        return can_follow()
+        return can_follow(account_id)
     elif action == "unfollow":
-        return can_unfollow()
+        return can_unfollow(account_id)
     return True

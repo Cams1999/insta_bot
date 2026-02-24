@@ -34,16 +34,19 @@ HOURLY_UNFOLLOW_LIMIT: int = 12
 DAILY_LIMIT_VARIANCE: float = 0.20  # +/- 20 %
 
 # --- Delays (seconds) – used as Gaussian bounds ---
-FOLLOW_DELAY_MIN: float = 25.0
-FOLLOW_DELAY_MAX: float = 120.0
-UNFOLLOW_DELAY_MIN: float = 20.0
-UNFOLLOW_DELAY_MAX: float = 90.0
-LIKE_DELAY_MIN: float = 5.0
-LIKE_DELAY_MAX: float = 15.0
-STORY_VIEW_DELAY_MIN: float = 3.0
-STORY_VIEW_DELAY_MAX: float = 10.0
-CHECK_DELAY_MIN: float = 3.0
-CHECK_DELAY_MAX: float = 8.0
+# Increased to reduce 429 rate limiting
+FOLLOW_DELAY_MIN: float = 40.0
+FOLLOW_DELAY_MAX: float = 180.0
+UNFOLLOW_DELAY_MIN: float = 35.0
+UNFOLLOW_DELAY_MAX: float = 120.0
+LIKE_DELAY_MIN: float = 8.0
+LIKE_DELAY_MAX: float = 25.0
+STORY_VIEW_DELAY_MIN: float = 5.0
+STORY_VIEW_DELAY_MAX: float = 18.0
+CHECK_DELAY_MIN: float = 6.0
+CHECK_DELAY_MAX: float = 15.0
+FETCH_DELAY_MIN: float = 10.0
+FETCH_DELAY_MAX: float = 30.0
 
 # --- Session breaks ---
 SESSION_BREAK_AFTER_MIN: int = 20
@@ -86,3 +89,8 @@ FILTER_MAX_FOLLOWING: int | None = None
 
 # --- Database ---
 DB_PATH: Path = DATA_DIR / "instabot.db"
+
+# --- Flask ---
+FLASK_SECRET_KEY: str = os.getenv("FLASK_SECRET_KEY", "change-me-in-production-!@#$%")
+FLASK_HOST: str = os.getenv("FLASK_HOST", "127.0.0.1")
+FLASK_PORT: int = int(os.getenv("FLASK_PORT", "5000"))

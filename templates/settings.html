@@ -1,0 +1,54 @@
+{% extends "base.html" %}
+{% block title %}Settings - InstaBot{% endblock %}
+
+{% block content %}
+<div class="mb-8">
+    <h2 class="text-2xl font-bold text-white">Settings</h2>
+    <p class="text-gray-500 text-sm mt-1">Global application settings</p>
+</div>
+
+<div class="grid gap-6 max-w-2xl">
+    <div class="bg-dark-800 rounded-xl border border-gray-800 p-6">
+        <h3 class="text-lg font-semibold text-white mb-4">About</h3>
+        <div class="space-y-3 text-sm">
+            <div class="flex justify-between">
+                <span class="text-gray-400">Version</span>
+                <span class="text-white">1.0.0</span>
+            </div>
+            <div class="flex justify-between">
+                <span class="text-gray-400">Backend</span>
+                <span class="text-white">Flask + Instagrapi</span>
+            </div>
+            <div class="flex justify-between">
+                <span class="text-gray-400">Database</span>
+                <span class="text-white">SQLite (local)</span>
+            </div>
+        </div>
+    </div>
+
+    <div class="bg-dark-800 rounded-xl border border-gray-800 p-6">
+        <h3 class="text-lg font-semibold text-white mb-4">Instructions</h3>
+        <div class="text-sm text-gray-400 space-y-2">
+            <p>1. Go to <a href="/accounts" class="text-accent-400 hover:underline">Accounts</a> and add an Instagram account.</p>
+            <p>2. Click "Test Connection" to verify the login works.</p>
+            <p>3. Click "Start Bot", enter a target account (e.g. "cristiano"), and set how many followers to follow.</p>
+            <p>4. The bot runs in the background. Monitor progress on the account detail page.</p>
+            <p>5. Configure limits, delays, and probabilities per account in the config section.</p>
+        </div>
+    </div>
+
+    <div class="bg-dark-800 rounded-xl border border-gray-800 p-6">
+        <h3 class="text-lg font-semibold text-white mb-4">Safety Tips</h3>
+        <div class="text-sm text-gray-400 space-y-2">
+            <p class="text-yellow-400">Use conservative limits to avoid Instagram action blocks:</p>
+            <ul class="list-disc list-inside space-y-1 ml-2">
+                <li>Start with 50-80 follows/day for the first week</li>
+                <li>Gradually increase to 100-150 over 2-3 weeks</li>
+                <li>Use a mobile 4G/5G proxy for best results</li>
+                <li>Keep your account active with regular posts and stories</li>
+                <li>Enable warm-up mode for accounts that haven't been active recently</li>
+            </ul>
+        </div>
+    </div>
+</div>
+{% endblock %}

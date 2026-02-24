@@ -217,6 +217,17 @@ def main() -> None:
     try:
         client.login()
         notifier.notify_success(f"Logged in as @{cfg.IG_USERNAME}")
+    except ConnectionError as exc:
+        console.print(Panel(
+            f"[bold red]Proxy/IP probleem:[/bold red] {exc}\n\n"
+            "Oplossingen:\n"
+            "  1. Zet PROXY_URL= leeg in .env om zonder proxy te testen\n"
+            "  2. Gebruik een andere proxy (bv. SOAX mobiele proxy)\n"
+            "  3. Probeer mobiel 4G/5G als hotspot",
+            title="IP Blocked",
+            border_style="red",
+        ))
+        sys.exit(1)
     except ChallengeError as exc:
         notifier.notify_challenge(str(exc))
         sys.exit(1)
@@ -228,7 +239,6 @@ def main() -> None:
         logging.getLogger("bot").debug(
             "Full traceback:\n%s", "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
         )
-        # Also print traceback to console for debugging
         console.print("[dim]Full traceback:[/dim]")
         traceback.print_exc()
         sys.exit(1)

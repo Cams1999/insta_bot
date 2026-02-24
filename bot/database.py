@@ -1,9 +1,10 @@
 """
-SQLite database layer.
-Handles schema creation, migrations, and all CRUD operations for:
-  - followed_users  (core tracking)
-  - activity_log    (audit trail)
-  - bot_config      (runtime configuration)
+SQLite database layer with multi-account support.
+Tables:
+  - accounts         (Instagram account management)
+  - followed_users   (core tracking, per account)
+  - activity_log     (audit trail, per account)
+  - bot_config       (runtime configuration, per account)
 """
 
 from __future__ import annotations
@@ -42,14 +43,32 @@ def get_connection(db_path: Path | None = None):
         conn.close()
 
 
+def _now() -> str:
+    return datetime.utcnow().isoformat()
+
+
 # ---------------------------------------------------------------------------
-# Schema & migrations
+# Schema
 # ---------------------------------------------------------------------------
 
 _SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS accounts (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    ig_username     TEXT    UNIQUE NOT NULL,
+    ig_password     TEXT    NOT NULL,
+    ig_2fa_seed     TEXT    DEFAULT '',
+    proxy_url       TEXT    DEFAULT '',
+    status          TEXT    NOT NULL DEFAULT 'inactive',
+    target_username TEXT    DEFAULT '',
+    follow_count    INTEGER DEFAULT 100,
+    created_at      TEXT    NOT NULL,
+    last_active_at  TEXT
+);
+
 CREATE TABLE IF NOT EXISTS followed_users (
     id                      INTEGER PRIMARY KEY AUTOINCREMENT,
-    instagram_user_id       TEXT    UNIQUE NOT NULL,
+    account_id              INTEGER NOT NULL DEFAULT 0,
+    instagram_user_id       TEXT    NOT NULL,
     username                TEXT    NOT NULL,
     full_name               TEXT,
     source_account          TEXT    NOT NULL,
@@ -61,28 +80,34 @@ CREATE TABLE IF NOT EXISTS followed_users (
     unfollowed_at           TEXT,
     likes_given             INTEGER NOT NULL DEFAULT 0,
     stories_viewed          INTEGER NOT NULL DEFAULT 0,
-    created_at              TEXT    NOT NULL
+    created_at              TEXT    NOT NULL,
+    UNIQUE(account_id, instagram_user_id)
 );
 
-CREATE INDEX IF NOT EXISTS idx_fu_status      ON followed_users(status);
-CREATE INDEX IF NOT EXISTS idx_fu_source      ON followed_users(source_account);
-CREATE INDEX IF NOT EXISTS idx_fu_followed_at ON followed_users(followed_at);
+CREATE INDEX IF NOT EXISTS idx_fu_account    ON followed_users(account_id);
+CREATE INDEX IF NOT EXISTS idx_fu_status     ON followed_users(status);
+CREATE INDEX IF NOT EXISTS idx_fu_source     ON followed_users(source_account);
+CREATE INDEX IF NOT EXISTS idx_fu_followed   ON followed_users(followed_at);
 
 CREATE TABLE IF NOT EXISTS activity_log (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    account_id      INTEGER NOT NULL DEFAULT 0,
     action          TEXT NOT NULL,
     target_username TEXT,
     details         TEXT,
     created_at      TEXT NOT NULL
 );
 
+CREATE INDEX IF NOT EXISTS idx_al_account    ON activity_log(account_id);
 CREATE INDEX IF NOT EXISTS idx_al_action     ON activity_log(action);
 CREATE INDEX IF NOT EXISTS idx_al_created_at ON activity_log(created_at);
 
 CREATE TABLE IF NOT EXISTS bot_config (
-    key         TEXT PRIMARY KEY,
-    value       TEXT NOT NULL,
-    description TEXT
+    account_id  INTEGER NOT NULL DEFAULT 0,
+    key         TEXT    NOT NULL,
+    value       TEXT    NOT NULL,
+    description TEXT,
+    PRIMARY KEY (account_id, key)
 );
 """
 
@@ -90,138 +115,172 @@ CREATE TABLE IF NOT EXISTS bot_config (
 def init_db(db_path: Path | None = None) -> None:
     with get_connection(db_path) as conn:
         conn.executescript(_SCHEMA_SQL)
-        _seed_default_config(conn)
 
 
-def _seed_default_config(conn: sqlite3.Connection) -> None:
+def seed_account_config(account_id: int, db_path: Path | None = None) -> None:
     defaults: list[tuple[str, str, str]] = [
         ("daily_follow_limit", str(cfg.DAILY_FOLLOW_LIMIT), "Max follows per day"),
         ("daily_unfollow_limit", str(cfg.DAILY_UNFOLLOW_LIMIT), "Max unfollows per day"),
         ("hourly_follow_limit", str(cfg.HOURLY_FOLLOW_LIMIT), "Max follows per hour"),
         ("hourly_unfollow_limit", str(cfg.HOURLY_UNFOLLOW_LIMIT), "Max unfollows per hour"),
         ("follow_back_check_days", str(cfg.FOLLOW_BACK_CHECK_DAYS), "Days before checking follow-back"),
-        ("unfollow_after_days", str(cfg.UNFOLLOW_AFTER_DAYS), "Days before auto-unfollowing non-followers"),
-        ("pending_request_timeout_days", str(cfg.PENDING_REQUEST_TIMEOUT_DAYS), "Days before withdrawing unanswered follow request"),
-        ("active_hours_start", str(cfg.ACTIVE_HOURS_START), "Bot active from (hour, 0-23)"),
-        ("active_hours_end", str(cfg.ACTIVE_HOURS_END), "Bot active until (hour, 0-23)"),
-        ("warmup_enabled", str(cfg.WARMUP_ENABLED), "Enable warm-up mode (True/False)"),
-        ("like_chance_min", str(cfg.LIKE_CHANCE_MIN), "Min probability of liking when following"),
-        ("like_chance_max", str(cfg.LIKE_CHANCE_MAX), "Max probability of liking when following"),
-        ("story_view_chance_min", str(cfg.STORY_VIEW_CHANCE_MIN), "Min probability of viewing story"),
-        ("story_view_chance_max", str(cfg.STORY_VIEW_CHANCE_MAX), "Max probability of viewing story"),
-        ("drift_period_min", str(cfg.DRIFT_PERIOD_MIN), "Min actions before re-rolling probability"),
-        ("drift_period_max", str(cfg.DRIFT_PERIOD_MAX), "Max actions before re-rolling probability"),
+        ("unfollow_after_days", str(cfg.UNFOLLOW_AFTER_DAYS), "Days before auto-unfollowing"),
+        ("pending_request_timeout_days", str(cfg.PENDING_REQUEST_TIMEOUT_DAYS), "Days before withdrawing request"),
+        ("active_hours_start", str(cfg.ACTIVE_HOURS_START), "Bot active from (hour)"),
+        ("active_hours_end", str(cfg.ACTIVE_HOURS_END), "Bot active until (hour)"),
+        ("warmup_enabled", str(cfg.WARMUP_ENABLED), "Enable warm-up mode"),
+        ("like_chance_min", str(cfg.LIKE_CHANCE_MIN), "Min like probability"),
+        ("like_chance_max", str(cfg.LIKE_CHANCE_MAX), "Max like probability"),
+        ("story_view_chance_min", str(cfg.STORY_VIEW_CHANCE_MIN), "Min story view probability"),
+        ("story_view_chance_max", str(cfg.STORY_VIEW_CHANCE_MAX), "Max story view probability"),
+        ("drift_period_min", str(cfg.DRIFT_PERIOD_MIN), "Min actions before re-rolling"),
+        ("drift_period_max", str(cfg.DRIFT_PERIOD_MAX), "Max actions before re-rolling"),
     ]
-    for key, value, desc in defaults:
-        conn.execute(
-            "INSERT OR IGNORE INTO bot_config (key, value, description) VALUES (?, ?, ?)",
-            (key, value, desc),
-        )
-
-
-# ---------------------------------------------------------------------------
-# bot_config helpers
-# ---------------------------------------------------------------------------
-
-def get_config(key: str, default: str | None = None, db_path: Path | None = None) -> str | None:
     with get_connection(db_path) as conn:
-        row = conn.execute("SELECT value FROM bot_config WHERE key = ?", (key,)).fetchone()
+        for key, value, desc in defaults:
+            conn.execute(
+                "INSERT OR IGNORE INTO bot_config (account_id, key, value, description) VALUES (?, ?, ?, ?)",
+                (account_id, key, value, desc),
+            )
+
+
+# ---------------------------------------------------------------------------
+# Accounts CRUD
+# ---------------------------------------------------------------------------
+
+def add_account(ig_username: str, ig_password: str, ig_2fa_seed: str = "",
+                proxy_url: str = "", db_path: Path | None = None) -> int:
+    with get_connection(db_path) as conn:
+        cur = conn.execute(
+            """INSERT INTO accounts (ig_username, ig_password, ig_2fa_seed, proxy_url, created_at)
+               VALUES (?, ?, ?, ?, ?)""",
+            (ig_username, ig_password, ig_2fa_seed, proxy_url, _now()),
+        )
+        account_id = cur.lastrowid
+    seed_account_config(account_id, db_path)
+    return account_id
+
+
+def update_account(account_id: int, **fields: Any) -> None:
+    if not fields:
+        return
+    sets = [f"{k} = ?" for k in fields]
+    vals = list(fields.values()) + [account_id]
+    with get_connection() as conn:
+        conn.execute(f"UPDATE accounts SET {', '.join(sets)} WHERE id = ?", vals)
+
+
+def delete_account(account_id: int) -> None:
+    with get_connection() as conn:
+        conn.execute("DELETE FROM followed_users WHERE account_id = ?", (account_id,))
+        conn.execute("DELETE FROM activity_log WHERE account_id = ?", (account_id,))
+        conn.execute("DELETE FROM bot_config WHERE account_id = ?", (account_id,))
+        conn.execute("DELETE FROM accounts WHERE id = ?", (account_id,))
+
+
+def get_account(account_id: int) -> dict | None:
+    with get_connection() as conn:
+        row = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()
+        return dict(row) if row else None
+
+
+def get_all_accounts() -> list[dict]:
+    with get_connection() as conn:
+        rows = conn.execute("SELECT * FROM accounts ORDER BY created_at DESC").fetchall()
+        return [dict(r) for r in rows]
+
+
+def set_account_status(account_id: int, status: str) -> None:
+    with get_connection() as conn:
+        conn.execute("UPDATE accounts SET status = ?, last_active_at = ? WHERE id = ?",
+                      (status, _now(), account_id))
+
+
+# ---------------------------------------------------------------------------
+# bot_config helpers (per account)
+# ---------------------------------------------------------------------------
+
+def get_config(key: str, default: str | None = None, account_id: int = 0,
+               db_path: Path | None = None) -> str | None:
+    with get_connection(db_path) as conn:
+        row = conn.execute(
+            "SELECT value FROM bot_config WHERE account_id = ? AND key = ?",
+            (account_id, key),
+        ).fetchone()
         return row["value"] if row else default
 
 
-def get_config_int(key: str, default: int = 0, **kw: Any) -> int:
-    val = get_config(key, **kw)
+def get_config_int(key: str, default: int = 0, account_id: int = 0, **kw: Any) -> int:
+    val = get_config(key, account_id=account_id, **kw)
     return int(val) if val is not None else default
 
 
-def get_config_float(key: str, default: float = 0.0, **kw: Any) -> float:
-    val = get_config(key, **kw)
+def get_config_float(key: str, default: float = 0.0, account_id: int = 0, **kw: Any) -> float:
+    val = get_config(key, account_id=account_id, **kw)
     return float(val) if val is not None else default
 
 
-def get_config_bool(key: str, default: bool = False, **kw: Any) -> bool:
-    val = get_config(key, **kw)
+def get_config_bool(key: str, default: bool = False, account_id: int = 0, **kw: Any) -> bool:
+    val = get_config(key, account_id=account_id, **kw)
     if val is None:
         return default
     return val.lower() in ("true", "1", "yes")
 
 
-def set_config(key: str, value: str, description: str | None = None, db_path: Path | None = None) -> None:
+def set_config(key: str, value: str, description: str | None = None,
+               account_id: int = 0, db_path: Path | None = None) -> None:
     with get_connection(db_path) as conn:
-        if description:
-            conn.execute(
-                "INSERT INTO bot_config (key, value, description) VALUES (?, ?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, description=excluded.description",
-                (key, value, description),
-            )
-        else:
-            conn.execute(
-                "INSERT INTO bot_config (key, value, description) VALUES (?, ?, '') "
-                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                (key, value),
-            )
+        conn.execute(
+            "INSERT INTO bot_config (account_id, key, value, description) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(account_id, key) DO UPDATE SET value=excluded.value",
+            (account_id, key, value, description or ""),
+        )
 
 
-def get_all_config(db_path: Path | None = None) -> list[dict[str, str]]:
+def get_all_config(account_id: int = 0, db_path: Path | None = None) -> list[dict[str, str]]:
     with get_connection(db_path) as conn:
-        rows = conn.execute("SELECT key, value, description FROM bot_config ORDER BY key").fetchall()
+        rows = conn.execute(
+            "SELECT key, value, description FROM bot_config WHERE account_id = ? ORDER BY key",
+            (account_id,),
+        ).fetchall()
         return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
-# followed_users CRUD
+# followed_users CRUD (per account)
 # ---------------------------------------------------------------------------
 
-def _now() -> str:
-    return datetime.utcnow().isoformat()
-
-
 def add_followed_user(
-    instagram_user_id: str,
-    username: str,
-    source_account: str,
-    is_private: bool = False,
-    full_name: str | None = None,
-    status: str = "following",
+    instagram_user_id: str, username: str, source_account: str,
+    is_private: bool = False, full_name: str | None = None,
+    status: str = "following", account_id: int = 0,
     db_path: Path | None = None,
 ) -> int:
     now = _now()
     with get_connection(db_path) as conn:
         cur = conn.execute(
             """INSERT INTO followed_users
-               (instagram_user_id, username, full_name, source_account,
+               (account_id, instagram_user_id, username, full_name, source_account,
                 is_private, status, followed_at, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (instagram_user_id, username, full_name, source_account,
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (account_id, instagram_user_id, username, full_name, source_account,
              int(is_private), status, now, now),
         )
-        return cur.lastrowid  # type: ignore[return-value]
+        return cur.lastrowid
 
 
-def user_exists(instagram_user_id: str, db_path: Path | None = None) -> bool:
+def user_exists(instagram_user_id: str, account_id: int = 0, db_path: Path | None = None) -> bool:
     with get_connection(db_path) as conn:
         row = conn.execute(
-            "SELECT 1 FROM followed_users WHERE instagram_user_id = ?",
-            (instagram_user_id,),
+            "SELECT 1 FROM followed_users WHERE account_id = ? AND instagram_user_id = ?",
+            (account_id, instagram_user_id),
         ).fetchone()
         return row is not None
 
 
-def get_user_by_ig_id(instagram_user_id: str, db_path: Path | None = None) -> dict | None:
-    with get_connection(db_path) as conn:
-        row = conn.execute(
-            "SELECT * FROM followed_users WHERE instagram_user_id = ?",
-            (instagram_user_id,),
-        ).fetchone()
-        return dict(row) if row else None
-
-
-def update_user_status(
-    instagram_user_id: str,
-    new_status: str,
-    db_path: Path | None = None,
-    **extra_fields: Any,
-) -> None:
+def update_user_status(instagram_user_id: str, new_status: str,
+                       account_id: int = 0, db_path: Path | None = None,
+                       **extra_fields: Any) -> None:
     sets = ["status = ?"]
     params: list[Any] = [new_status]
 
@@ -239,162 +298,209 @@ def update_user_status(
         sets.append(f"{col} = ?")
         params.append(val)
 
-    params.append(instagram_user_id)
-    sql = f"UPDATE followed_users SET {', '.join(sets)} WHERE instagram_user_id = ?"
+    params.extend([account_id, instagram_user_id])
+    sql = f"UPDATE followed_users SET {', '.join(sets)} WHERE account_id = ? AND instagram_user_id = ?"
     with get_connection(db_path) as conn:
         conn.execute(sql, params)
 
 
-def increment_likes(instagram_user_id: str, count: int = 1, db_path: Path | None = None) -> None:
+def increment_likes(instagram_user_id: str, count: int = 1,
+                    account_id: int = 0, db_path: Path | None = None) -> None:
     with get_connection(db_path) as conn:
         conn.execute(
-            "UPDATE followed_users SET likes_given = likes_given + ? WHERE instagram_user_id = ?",
-            (count, instagram_user_id),
+            "UPDATE followed_users SET likes_given = likes_given + ? "
+            "WHERE account_id = ? AND instagram_user_id = ?",
+            (count, account_id, instagram_user_id),
         )
 
 
-def increment_stories(instagram_user_id: str, count: int = 1, db_path: Path | None = None) -> None:
+def increment_stories(instagram_user_id: str, count: int = 1,
+                      account_id: int = 0, db_path: Path | None = None) -> None:
     with get_connection(db_path) as conn:
         conn.execute(
-            "UPDATE followed_users SET stories_viewed = stories_viewed + ? WHERE instagram_user_id = ?",
-            (count, instagram_user_id),
+            "UPDATE followed_users SET stories_viewed = stories_viewed + ? "
+            "WHERE account_id = ? AND instagram_user_id = ?",
+            (count, account_id, instagram_user_id),
         )
 
 
 # ---------------------------------------------------------------------------
-# Query helpers for the engine
+# Query helpers (per account)
 # ---------------------------------------------------------------------------
 
-def get_users_to_check_followback(db_path: Path | None = None) -> list[dict]:
-    """Users with status 'following' whose followed_at is older than FOLLOW_BACK_CHECK_DAYS."""
-    days = get_config_int("follow_back_check_days", cfg.FOLLOW_BACK_CHECK_DAYS, db_path=db_path)
+def get_users_to_check_followback(account_id: int = 0, db_path: Path | None = None) -> list[dict]:
+    days = get_config_int("follow_back_check_days", cfg.FOLLOW_BACK_CHECK_DAYS, account_id=account_id)
     cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
     with get_connection(db_path) as conn:
         rows = conn.execute(
-            "SELECT * FROM followed_users WHERE status = 'following' AND followed_at <= ?",
-            (cutoff,),
+            "SELECT * FROM followed_users WHERE account_id = ? AND status = 'following' AND followed_at <= ?",
+            (account_id, cutoff),
         ).fetchall()
         return [dict(r) for r in rows]
 
 
-def get_users_to_unfollow(db_path: Path | None = None) -> list[dict]:
-    """Users whose follow-back window expired (status 'following', older than UNFOLLOW_AFTER_DAYS)."""
-    days = get_config_int("unfollow_after_days", cfg.UNFOLLOW_AFTER_DAYS, db_path=db_path)
+def get_users_to_unfollow(account_id: int = 0, db_path: Path | None = None) -> list[dict]:
+    days = get_config_int("unfollow_after_days", cfg.UNFOLLOW_AFTER_DAYS, account_id=account_id)
     cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
     with get_connection(db_path) as conn:
         rows = conn.execute(
-            "SELECT * FROM followed_users WHERE status = 'following' AND followed_at <= ?",
-            (cutoff,),
+            "SELECT * FROM followed_users WHERE account_id = ? AND status = 'following' AND followed_at <= ?",
+            (account_id, cutoff),
         ).fetchall()
         return [dict(r) for r in rows]
 
 
-def get_users_followed_back(db_path: Path | None = None) -> list[dict]:
-    """Users who followed back and should be unfollowed now."""
+def get_users_followed_back(account_id: int = 0, db_path: Path | None = None) -> list[dict]:
     with get_connection(db_path) as conn:
         rows = conn.execute(
-            "SELECT * FROM followed_users WHERE status = 'followed_back'"
+            "SELECT * FROM followed_users WHERE account_id = ? AND status = 'followed_back'",
+            (account_id,),
         ).fetchall()
         return [dict(r) for r in rows]
 
 
-def get_pending_requests(db_path: Path | None = None) -> list[dict]:
-    """Private account follow requests still pending."""
+def get_pending_requests(account_id: int = 0, db_path: Path | None = None) -> list[dict]:
     with get_connection(db_path) as conn:
         rows = conn.execute(
-            "SELECT * FROM followed_users WHERE status = 'pending_request'"
+            "SELECT * FROM followed_users WHERE account_id = ? AND status = 'pending_request'",
+            (account_id,),
         ).fetchall()
         return [dict(r) for r in rows]
 
 
-def get_expired_pending_requests(db_path: Path | None = None) -> list[dict]:
-    """Pending requests older than PENDING_REQUEST_TIMEOUT_DAYS."""
-    days = get_config_int("pending_request_timeout_days", cfg.PENDING_REQUEST_TIMEOUT_DAYS, db_path=db_path)
+def get_expired_pending_requests(account_id: int = 0, db_path: Path | None = None) -> list[dict]:
+    days = get_config_int("pending_request_timeout_days", cfg.PENDING_REQUEST_TIMEOUT_DAYS, account_id=account_id)
     cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
     with get_connection(db_path) as conn:
         rows = conn.execute(
-            "SELECT * FROM followed_users WHERE status = 'pending_request' AND followed_at <= ?",
-            (cutoff,),
+            "SELECT * FROM followed_users WHERE account_id = ? AND status = 'pending_request' AND followed_at <= ?",
+            (account_id, cutoff),
         ).fetchall()
         return [dict(r) for r in rows]
 
 
 # ---------------------------------------------------------------------------
-# Stats / counts
+# Stats / counts (per account)
 # ---------------------------------------------------------------------------
 
-def count_today_actions(action: str, db_path: Path | None = None) -> int:
+def count_today_actions(action: str, account_id: int = 0, db_path: Path | None = None) -> int:
     today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
     with get_connection(db_path) as conn:
         row = conn.execute(
-            "SELECT COUNT(*) as cnt FROM activity_log WHERE action = ? AND created_at >= ?",
-            (action, today_start),
+            "SELECT COUNT(*) as cnt FROM activity_log WHERE account_id = ? AND action = ? AND created_at >= ?",
+            (account_id, action, today_start),
         ).fetchone()
         return row["cnt"] if row else 0
 
 
-def count_hour_actions(action: str, db_path: Path | None = None) -> int:
+def count_hour_actions(action: str, account_id: int = 0, db_path: Path | None = None) -> int:
     hour_ago = (datetime.utcnow() - timedelta(hours=1)).isoformat()
     with get_connection(db_path) as conn:
         row = conn.execute(
-            "SELECT COUNT(*) as cnt FROM activity_log WHERE action = ? AND created_at >= ?",
-            (action, hour_ago),
+            "SELECT COUNT(*) as cnt FROM activity_log WHERE account_id = ? AND action = ? AND created_at >= ?",
+            (account_id, action, hour_ago),
         ).fetchone()
         return row["cnt"] if row else 0
 
 
-def get_stats(db_path: Path | None = None) -> dict[str, int]:
+def get_stats(account_id: int = 0, db_path: Path | None = None) -> dict[str, Any]:
     with get_connection(db_path) as conn:
         def _count(where: str) -> int:
-            r = conn.execute(f"SELECT COUNT(*) as cnt FROM followed_users WHERE {where}").fetchone()
+            r = conn.execute(
+                f"SELECT COUNT(*) as cnt FROM followed_users WHERE account_id = ? AND {where}",
+                (account_id,),
+            ).fetchone()
             return r["cnt"] if r else 0
 
         today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
 
-        total_followed = _count("1=1")
-        active_following = _count("status = 'following'")
-        followed_back = _count("status = 'followed_back'")
+        total = _count("1=1")
+        following = _count("status = 'following'")
+        backed = _count("status = 'followed_back'")
         unfollowed = _count("status = 'unfollowed'")
-        pending_requests = _count("status = 'pending_request'")
+        pending = _count("status = 'pending_request'")
         withdrawn = _count("status = 'request_withdrawn'")
 
-        today_followed = conn.execute(
-            "SELECT COUNT(*) as cnt FROM activity_log WHERE action = 'follow' AND created_at >= ?",
-            (today_start,),
+        today_f = conn.execute(
+            "SELECT COUNT(*) as cnt FROM activity_log WHERE account_id = ? AND action = 'follow' AND created_at >= ?",
+            (account_id, today_start),
         ).fetchone()["cnt"]
-        today_unfollowed = conn.execute(
-            "SELECT COUNT(*) as cnt FROM activity_log WHERE action = 'unfollow' AND created_at >= ?",
-            (today_start,),
+        today_u = conn.execute(
+            "SELECT COUNT(*) as cnt FROM activity_log WHERE account_id = ? AND action = 'unfollow' AND created_at >= ?",
+            (account_id, today_start),
+        ).fetchone()["cnt"]
+        today_l = conn.execute(
+            "SELECT COUNT(*) as cnt FROM activity_log WHERE account_id = ? AND action = 'like' AND created_at >= ?",
+            (account_id, today_start),
         ).fetchone()["cnt"]
 
         return {
-            "total_followed": total_followed,
-            "active_following": active_following,
-            "followed_back": followed_back,
+            "total_followed": total,
+            "active_following": following,
+            "followed_back": backed,
             "unfollowed": unfollowed,
-            "pending_requests": pending_requests,
+            "pending_requests": pending,
             "request_withdrawn": withdrawn,
-            "today_followed": today_followed,
-            "today_unfollowed": today_unfollowed,
-            "followback_ratio": round(followed_back / max(total_followed, 1) * 100, 1),
+            "today_followed": today_f,
+            "today_unfollowed": today_u,
+            "today_liked": today_l,
+            "followback_ratio": round(backed / max(total, 1) * 100, 1),
         }
 
 
+def get_daily_stats(account_id: int = 0, days: int = 14, db_path: Path | None = None) -> list[dict]:
+    """Get aggregated stats per day for charting."""
+    cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()[:10]
+    with get_connection(db_path) as conn:
+        rows = conn.execute(
+            """SELECT DATE(created_at) as day, action, COUNT(*) as cnt
+               FROM activity_log
+               WHERE account_id = ? AND DATE(created_at) >= ?
+               GROUP BY DATE(created_at), action
+               ORDER BY day""",
+            (account_id, cutoff),
+        ).fetchall()
+        result: dict[str, dict[str, int]] = {}
+        for r in rows:
+            d = r["day"]
+            if d not in result:
+                result[d] = {"day": d, "follow": 0, "unfollow": 0, "like": 0, "story_view": 0}
+            if r["action"] in result[d]:
+                result[d][r["action"]] = r["cnt"]
+        return list(result.values())
+
+
 # ---------------------------------------------------------------------------
-# Activity log
+# Activity log (per account)
 # ---------------------------------------------------------------------------
 
-def log_activity(action: str, target_username: str = "", details: str = "", db_path: Path | None = None) -> None:
+def log_activity(action: str, target_username: str = "", details: str = "",
+                 account_id: int = 0, db_path: Path | None = None) -> None:
     with get_connection(db_path) as conn:
         conn.execute(
-            "INSERT INTO activity_log (action, target_username, details, created_at) VALUES (?, ?, ?, ?)",
-            (action, target_username, details, _now()),
+            "INSERT INTO activity_log (account_id, action, target_username, details, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (account_id, action, target_username, details, _now()),
         )
 
 
-def get_recent_activity(limit: int = 50, db_path: Path | None = None) -> list[dict]:
+def get_recent_activity(limit: int = 50, account_id: int = 0, db_path: Path | None = None) -> list[dict]:
     with get_connection(db_path) as conn:
         rows = conn.execute(
-            "SELECT * FROM activity_log ORDER BY created_at DESC LIMIT ?", (limit,)
+            "SELECT * FROM activity_log WHERE account_id = ? ORDER BY created_at DESC LIMIT ?",
+            (account_id, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def get_global_recent_activity(limit: int = 50) -> list[dict]:
+    """Activity across all accounts, with username joined."""
+    with get_connection() as conn:
+        rows = conn.execute(
+            """SELECT al.*, a.ig_username as account_username
+               FROM activity_log al
+               LEFT JOIN accounts a ON al.account_id = a.id
+               ORDER BY al.created_at DESC LIMIT ?""",
+            (limit,),
         ).fetchall()
         return [dict(r) for r in rows]
